@@ -1,0 +1,29 @@
+# Terraform Variables Configuration
+# Copy this file to terraform.tfvars and update with your values
+
+# AWS Region
+aws_region = "ap-northeast-2"
+
+# Project Name
+project_name = "log-platform-dev"
+
+# Environment
+environment = "development"
+
+# EC2 Key Pair Name (create this in AWS Console first!)
+# 1. Go to EC2 → Key Pairs
+# 2. Create new key pair
+# 3. Download .pem file to ~/.ssh/
+# 4. chmod 400 ~/.ssh/<keypair>.pem
+# 5. Update this value (without .pem extension)
+ec2_key_name = "log-platform-key-v4"
+
+# EC2 AMI ID (Ubuntu 22.04 - ap-northeast-2)
+ec2_ami_id = "ami-0c9c942bd7bf113a2"
+
+# OpenSearch Master User Credentials
+opensearch_master_user = "admin"
+
+# OpenSearch Master Password
+# Must be at least 8 characters with uppercase, lowercase, number, and special character
+opensearch_master_password = "Fkvk1234!"

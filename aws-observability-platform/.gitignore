@@ -1,0 +1,22 @@
+# terraform
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+*.tfvars.json
+*.tfplan
+
+# aws keys
+*accessKeys.csv
+
+# ssh keys
+*.pem
+*.key
+*.ppk
+
+# env
+.env
+.env.*
+
+# crash
+crash.log
