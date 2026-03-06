@@ -21,7 +21,7 @@ AWS 기반 Observability 플랫폼으로, OpenTelemetry를 활용한 로그, 트
 └─────────────────────────────────────────────────────────────────────┘
 
 [외부 OTel Collector]
-        ↓ (OTLP gRPC/HTTP)
+        ↓ (OTLP gRPC/HTTP + JWT)
 [Envoy Proxy - JWT 인증]
         ↓
 [EC2 OTel Collector]
@@ -35,7 +35,242 @@ AWS 기반 Observability 플랫폼으로, OpenTelemetry를 활용한 로그, 트
 
 ┌─────────────────────────────────────────────────────────────────────┐
 │                           AI 분석 및 알림                             │
+└─────────────────────────────────────────────────────────────────────┘
+
+[AMP Alertmanager]
+        ↓
+    [SNS Topic]
+        ↓
+[Lambda - AI Agent]
+        ├─→ [AMP] - 메트릭 쿼리 (PromQL)
+        ├─→ [OpenSearch] - 로그/트레이스 검색
+        ├─→ [OpenSearch Serverless] - 런북 벡터 검색
+        ├─→ [Bedrock Claude] - AI 분석 및 종합
+        └─→ [Slack] - 최종 분석 결과 전송
+
+[S3 Runbooks Bucket]
+        ↓ (마크다운 업로드)
+[Lambda - Runbook Indexer]
+        ├─→ [Bedrock Titan Embed] - 텍스트 임베딩
+        └─→ [OpenSearch Serverless] - 벡터 저장
 ```
+
+---
+
+## 데이터 수집 및 전달 흐름 상세
+
+### 메트릭 수집 흐름
+
+```
+[외부 애플리케이션]
+    ↓ (OpenTelemetry SDK)
+[외부 OTel Collector]
+    ↓ (OTLP gRPC: 4317 / HTTP: 4318 + JWT 토큰)
+[Envoy Proxy] - JWT 검증 (Cognito JWKS)
+    ↓
+[EC2 OTel Collector]
+    ↓ (prometheusremotewrite exporter)
+[Amazon Managed Prometheus (AMP)]
+    ├─→ [Grafana] - 실시간 시각화
+    ├─→ [Alertmanager] - 알림 규칙 평가
+    └─→ [S3 metrics-backup] - 장기 백업 (365일)
+```
+
+**저장 데이터:** JVM CPU/메모리/GC/스레드, HTTP 요청수/응답시간/에러율, DB 커넥션 풀
+
+### 로그 수집 흐름
+
+```
+[외부 애플리케이션]
+    ↓ (OpenTelemetry SDK)
+[외부 OTel Collector]
+    ↓ (OTLP HTTP + JWT 토큰)
+[Envoy Proxy] - JWT 검증
+    ↓
+[EC2 OTel Collector]
+    ↓ (otlphttp exporter)
+[OpenSearch Ingestion Pipeline (OSIS)]
+    ├─ 데이터 변환 및 정규화
+    ├─ 일별 인덱스 생성 (logs-YYYY.MM.dd)
+    └─ 필드 매핑 (timestamp, severity, body 등)
+    ↓
+[OpenSearch Domain]
+    ├─ 실시간 검색 및 분석
+    ├─ ISM 정책: 30일 후 자동 삭제
+    └─ 병렬 S3 백업 (30일 보관)
+    ↓
+[S3 logs-backup]
+    ↓ (매일 새벽 2시)
+[Glue Crawler] - 스키마 자동 생성
+    ↓
+[Athena] - SQL 쿼리 분석
+```
+
+**저장 데이터:** 애플리케이션 로그 (INFO/WARN/ERROR), 시스템 로그, 보안 로그
+
+### 트레이스 수집 흐름
+
+```
+[외부 애플리케이션]
+    ↓ (OpenTelemetry SDK)
+[외부 OTel Collector]
+    ↓ (OTLP HTTP + JWT 토큰)
+[Envoy Proxy] - JWT 검증
+    ↓
+[EC2 OTel Collector]
+    ↓ (otlphttp exporter)
+[OpenSearch Ingestion Pipeline (OSIS)]
+    ├─ otel_traces 프로세서: Span 데이터 변환
+    ├─ service_map 프로세서: 서비스 맵 생성
+    └─ 인덱스: trace-analytics-raw, service-map
+    ↓
+[OpenSearch Domain]
+    ├─ Trace Analytics 대시보드
+    ├─ 서비스 맵 시각화
+    ├─ Span 검색 (느린 요청, 에러 추적)
+    └─ 병렬 S3 백업 (30일 보관)
+    ↓
+[S3 traces-backup]
+    ↓ (매일 새벽 2시)
+[Glue Crawler] - 스키마 자동 생성
+    ↓
+[Athena] - SQL 쿼리 분석
+```
+
+**저장 데이터:** Span (traceId/spanId/parentSpanId), 서비스명, 작업명, 응답시간, 에러 여부
+
+### 데이터 보관 정책
+
+| 데이터 타입 | 실시간 저장소 | 보관 기간 | 장기 저장소 | 보관 기간 |
+|------------|--------------|----------|------------|----------|
+| 메트릭     | AMP          | 무제한   | S3         | 365일    |
+| 로그       | OpenSearch   | 30일     | S3         | 30일     |
+| 트레이스   | OpenSearch   | 30일     | S3         | 30일     |
+
+---
+
+## AI 분석 및 알림 흐름 상세
+
+### 1. 알림 트리거 및 Lambda 실행
+
+```
+[AMP Alertmanager] - 알림 규칙 평가
+    ├─ HighJvmCpu: JVM CPU 80% 초과 (2분)
+    ├─ HighJvmMemory: JVM 메모리 85% 초과 (2분)
+    ├─ HighHttpErrorRate: HTTP 에러율 50% 초과 (30초)
+    ├─ HighHttpLatency: P95 응답시간 1초 초과 (2분)
+    └─ HighDbConnectionPending: DB 커넥션 대기 5개 초과 (1분)
+    ↓ (조건 충족 시)
+[SNS Topic: log-platform-dev-alerts]
+    ↓
+[Lambda: observability-agent]
+    ├─ 1. SNS 메시지 파싱 (alertname, severity, service)
+    ├─ 2. Slack "분석 중..." 메시지 전송 (즉시 피드백)
+    └─ 3. LangGraph AI Agent 실행
+```
+
+### 2. LangGraph 워크플로우 (4단계)
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ Step 1: Classify Node (Bedrock Claude 직접 호출)            │
+│   - 질문 분석: "HTTP 5xx 에러율 50% 초과 알람 분석"         │
+│   - 필요 데이터 판단: ["metrics", "logs", "traces"]         │
+└─────────────────────────────────────────────────────────────┘
+    ↓
+┌─────────────────────────────────────────────────────────────┐
+│ Step 2: 병렬 데이터 수집 (3개 Strands Agent 동시 실행)      │
+│                                                             │
+│   ┌─────────────┐  ┌─────────────┐  ┌─────────────┐       │
+│   │ Metrics     │  │ Logs        │  │ Traces      │       │
+│   │ Agent       │  │ Agent       │  │ Agent       │       │
+│   └─────────────┘  └─────────────┘  └─────────────┘       │
+│         ↓                ↓                ↓                │
+│   [AMP 쿼리]      [OpenSearch]     [OpenSearch]            │
+│   PromQL          로그 검색        트레이스 검색            │
+│   5-10회          4-7회            3-5회                   │
+└─────────────────────────────────────────────────────────────┘
+    ↓
+┌─────────────────────────────────────────────────────────────┐
+│ Step 3: Runbook Search (병렬 실행)                          │
+│   - OpenSearch Serverless 벡터 검색                         │
+│   - Bedrock Titan Embed로 쿼리 임베딩                       │
+│   - 유사도 기반 관련 런북 검색 (상위 2개)                   │
+└─────────────────────────────────────────────────────────────┘
+    ↓
+┌─────────────────────────────────────────────────────────────┐
+│ Step 4: Synthesize Node (Bedrock Claude 직접 호출)          │
+│   - 입력: 3개 Agent 결과 + 런북 검색 결과                   │
+│   - 출력: JSON 형식 IncidentReport                          │
+│     {                                                       │
+│       "incident_summary": "한 문장 요약",                   │
+│       "likely_root_causes": ["원인1", "원인2"],             │
+│       "severity": "critical",                               │
+│       "impact": "영향 범위",                                │
+│       "immediate_actions": ["즉시 조치1", "즉시 조치2"],    │
+│       "follow_up_actions": ["후속 조치1", "후속 조치2"],    │
+│       "evidence_summary": ["근거1", "근거2"],               │
+│       "runbook_references": [...]                           │
+│     }                                                       │
+└─────────────────────────────────────────────────────────────┘
+    ↓
+[Slack 최종 분석 결과 전송]
+    ├─ 기존 "분석 중..." 메시지 삭제
+    └─ 최종 분석 결과 새로 전송 (Block Kit 형식)
+```
+
+### 3. 런북 벡터 검색 흐름
+
+```
+[S3 Runbooks Bucket]
+    ↓ (마크다운 파일 업로드)
+    └─ s3://runbooks-bucket/runbooks/HighHttpErrorRate.md
+    ↓ (S3 이벤트 트리거)
+[Lambda: runbooks-indexer]
+    ├─ 1. S3에서 마크다운 파일 로드
+    ├─ 2. Bedrock Titan Embed Text v2로 임베딩 (1024차원)
+    └─ 3. OpenSearch Serverless에 벡터 저장
+    ↓
+[OpenSearch Serverless - VECTORSEARCH]
+    └─ 인덱스: runbooks
+        ├─ filename: "HighHttpErrorRate.md"
+        ├─ title: "상태코드별 분포"
+        ├─ severity: "critical"
+        ├─ action: "1. 에러 상태코드 분포 확인..."
+        └─ embedding: [0.123, -0.456, ...] (1024차원)
+    ↓
+[AI Agent 알람 발생 시]
+    ├─ 1. 쿼리: "HTTP 5xx 에러율 50% 초과"
+    ├─ 2. Bedrock Titan Embed로 쿼리 임베딩
+    ├─ 3. OpenSearch Serverless KNN 검색
+    └─ 4. 유사도 상위 2개 런북 반환
+        ├─ HighHttpErrorRate.md (관련도 0.85)
+        └─ HighHttpLatency.md (관련도 0.69)
+```
+
+### 4. 데이터 흐름 타임라인
+
+```
+T+0초:   AMP Alertmanager가 알림 규칙 평가
+T+10초:  조건 충족 → SNS 발행
+T+11초:  Lambda 트리거 → Handler 실행
+T+12초:  Slack "분석 중..." 메시지 전송
+T+13초:  LangGraph Classify Node 실행 (Bedrock 호출 #1)
+T+15초:  3개 Agent 병렬 실행 시작
+T+20초:  Metrics Agent 완료 (Bedrock 호출 #2, AMP 쿼리 5회)
+T+25초:  Logs Agent 완료 (Bedrock 호출 #3, OpenSearch 쿼리 4회)
+T+30초:  Traces Agent 완료 (Bedrock 호출 #4, OpenSearch 쿼리 3회)
+T+32초:  Runbook Search 완료 (벡터 검색 1회)
+T+35초:  Synthesize Node 실행 (Bedrock 호출 #5)
+T+40초:  최종 JSON 생성 완료
+T+41초:  Slack 최종 분석 결과 전송
+T+42초:  Lambda 종료
+```
+
+**총 소요 시간:** 약 30-60초  
+**Bedrock 호출:** 5회 (LLM 인스턴스는 2개만 사용)  
+**AMP 쿼리:** 5-10회  
+**OpenSearch 쿼리:** 7-15회
 
 ---
 
