@@ -13,7 +13,13 @@ AWS 기반 Observability 플랫폼으로, OpenTelemetry를 활용한 로그, 트
 
 ## 아키텍처 다이어그램
 
+### 전체 시스템 구조
+
 ```
+┌─────────────────────────────────────────────────────────────────────┐
+│                        데이터 수집 및 전달                            │
+└─────────────────────────────────────────────────────────────────────┘
+
 [외부 OTel Collector]
         ↓ (OTLP gRPC/HTTP)
 [Envoy Proxy - JWT 인증]
@@ -27,14 +33,26 @@ AWS 기반 Observability 플랫폼으로, OpenTelemetry를 활용한 로그, 트
                 ↓
         [Glue Crawler + Athena] - 장기 분석
 
-[AMP Alertmanager]
-        ↓
-    [SNS Topic]
+┌─────────────────────────────────────────────────────────────────────┐
+│                           AI 분석 및 알림                             │
+```
+
+---
+
+## 데이터 수집 및 전달 흐름c]
         ↓
 [Lambda - AI Agent]
-        ├─→ [Bedrock] - AI 분석
+        ├─→ [AMP] - 메트릭 쿼리 (PromQL)
+        ├─→ [OpenSearch] - 로그/트레이스 검색
         ├─→ [OpenSearch Serverless] - 런북 벡터 검색
-        └─→ [Slack] - 알림 전송
+        ├─→ [Bedrock Claude] - AI 분석 및 종합
+        └─→ [Slack] - 최종 분석 결과 전송
+
+[S3 Runbooks Bucket]
+        ↓ (마크다운 업로드)
+[Lambda - Runbook Indexer]
+        ├─→ [Bedrock Titan Embed] - 텍스트 임베딩
+        └─→ [OpenSearch Serverless] - 벡터 저장
 ```
 
 ---
