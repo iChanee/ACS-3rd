@@ -363,7 +363,18 @@ AMP Alert → Alertmanager → SNS → Lambda (handler)
 
 ### Lambda가 Bedrock과 AMP/OpenSearch를 사용하는 방식
 
-Lambda 함수는 **직접** Bedrock을 호출하지 않고, **LangGraph + Strands Agent 패턴**을 사용합니다:
+Lambda 함수는 **LangGraph 워크플로우 + Strands Agent 3개** 구조를 사용합니다:
+
+**구조:**
+
+- **메인 Agent는 없음** - LangGraph가 워크플로우만 제어
+- **Strands Agent 3개**: metrics_agent, logs_agent, traces_agent
+- **Bedrock Claude (LLM 인스턴스 1개로 통합)** ✅
+  - `shared_llm` (shared_llm.py): 모든 곳에서 공유
+  - graph_agent.py: classify, synthesize에서 사용
+  - agents_aws.py: 3개 Agent가 공유
+- **총 LLM 호출**: 최대 5번
+- **메모리 절약**: 50MB 절감 (100MB → 50MB)
 
 #### 1단계: LangGraph 워크플로우 제어
 
@@ -371,17 +382,22 @@ Lambda 함수는 **직접** Bedrock을 호출하지 않고, **LangGraph + Strand
 - 노드: classify → metrics/logs/traces (병렬) → runbook → synthesize
 - 각 노드는 독립적으로 실행되며 상태(State)를 공유
 
-#### 2단계: Strands Agent가 Tool 선택
+#### 2단계: Bedrock Claude가 직접 분류 (classify_node)
+
+- LangGraph의 classify_node에서 Bedrock Claude를 직접 호출
+- 질문을 분석해서 어떤 데이터가 필요한지 판단 (metrics/logs/traces)
+
+#### 3단계: Strands Agent 3개가 병렬 실행
 
 - **agents_aws.py**에 3개의 전문 Agent 정의:
-  - `metrics_agent`: 메트릭 분석 전문
-  - `logs_agent`: 로그 분석 전문
-  - `traces_agent`: 트레이스 분석 전문
+  - `metrics_agent`: 메트릭 분석 전문 (Strands Agent)
+  - `logs_agent`: 로그 분석 전문 (Strands Agent)
+  - `traces_agent`: 트레이스 분석 전문 (Strands Agent)
 
 - 각 Agent는 **Bedrock Claude**를 LLM으로 사용
 - Agent가 질문을 받으면 **자동으로 적절한 Tool을 선택하여 실행**
 
-#### 3단계: Tool이 실제 데이터 조회
+#### 4단계: Tool이 실제 데이터 조회
 
 각 Tool 함수는 **직접** AWS 서비스에 쿼리를 실행합니다:
 
@@ -410,7 +426,7 @@ def query_opensearch("otel-v1-apm-span-*", query):
     # 예: durationInNanos > 100ms인 느린 span 검색
 ```
 
-#### 4단계: Bedrock이 결과 해석 및 종합
+#### 5단계: Bedrock이 결과 해석
 
 - **Metrics Agent**: Tool 실행 결과를 받아 Bedrock이 해석
   - "JVM CPU 80% 초과, 메모리 85% 사용 중" → "리소스 부족 상태"
@@ -419,27 +435,34 @@ def query_opensearch("otel-v1-apm-span-*", query):
 - **Traces Agent**: Tool 실행 결과를 받아 Bedrock이 해석
   - "P95 응답시간 2초, DB 쿼리 느림" → "데이터베이스 성능 저하"
 
-#### 5단계: 최종 종합 분석
+#### 6단계: Bedrock이 최종 종합 분석 (synthesize_node)
 
-- **Synthesize Node**에서 Bedrock이 모든 결과를 종합
+- **Synthesize Node**에서 Bedrock Claude를 직접 호출
 - 입력: 3개 Agent의 분석 결과 + 런북 검색 결과
 - 출력: 구조화된 JSON (IncidentReport)
 
 ### 핵심 포인트
 
-1. **Lambda는 오케스트레이터 역할**
-   - LangGraph로 워크플로우 제어
-   - 각 단계를 순차/병렬 실행
+1. **LangGraph는 워크플로우 오케스트레이터**
+   - 메인 Agent가 아님
+   - 노드 간 실행 순서와 상태 관리만 담당
 
-2. **Bedrock은 2가지 역할**
-   - **Tool 선택**: Agent가 어떤 Tool을 실행할지 결정
-   - **결과 해석**: Tool 실행 결과를 사람이 이해할 수 있게 분석
+2. **Strands Agent 3개가 실제 분석 수행**
+   - metrics_agent, logs_agent, traces_agent
+3. **Bedrock Claude 사용 (LLM 인스턴스 1개로 통합)** ✅
+   - **shared_llm.py의 `shared_llm`**: 모든 곳에서 공유
+   - graph_agent.py: classify_node, synthesize_node에서 사용
+   - agents_aws.py: 3개 Strands Agent가 공유
+   - 총 LLM 호출: 최대 5번 (classify + 3개 agent + synthesize)
+   - 총 LLM 인스턴스: 1개만 생성 (메모리 50% 절감)model`**: 3개 Strands Agent가 공유
+   - 총 LLM 호출: 최대 5번 (classify + 3개 agent + synthesize)
+   - 총 LLM 인스턴스: 2개만 생성
 
-3. **실제 데이터 조회는 Tool 함수가 직접 수행**
+4. **실제 데이터 조회는 Tool 함수가 직접 수행**
    - AMP: boto3 + SigV4 인증 + PromQL
    - OpenSearch: urllib + Basic Auth + REST API
 
-4. **Bedrock은 데이터를 직접 보지 않음**
+5. **Bedrock은 데이터를 직접 보지 않음**
    - Tool이 조회한 결과(텍스트)를 받아서 해석만 함
    - 예: "CPU 80%" → Bedrock → "리소스 부족 상태로 판단됨"
 
@@ -450,17 +473,21 @@ def query_opensearch("otel-v1-apm-span-*", query):
     ↓
 Lambda Handler: "JVM CPU 80% 초과 알람 분석해줘"
     ↓
-LangGraph Classify: "metrics 데이터 필요"
+LangGraph classify_node: Bedrock Claude 직접 호출
+    → "metrics 데이터 필요"
     ↓
-Metrics Agent (Bedrock): "get_jvm_metrics 실행해야겠다"
+LangGraph metrics_node: metrics_agent 실행
     ↓
-get_jvm_metrics Tool: AMP에 PromQL 쿼리
+Metrics Agent (Strands Agent + Bedrock): "get_jvm_metrics 실행해야겠다"
+    ↓
+get_jvm_metrics Tool: AMP에 Prom QL 쿼리
     → jvm_cpu_recent_utilization_ratio
     → 결과: service-a: 0.85, service-b: 0.45
     ↓
 Metrics Agent (Bedrock): "service-a의 CPU가 85%로 높음"
     ↓
-Synthesize (Bedrock): 모든 결과 종합
+LangGraph synthesize_node: Bedrock Claude 직접 호출
+    → 모든 결과 종합
     → "service-a의 CPU 과부하로 인한 성능 저하"
     → JSON 생성
     ↓
@@ -652,9 +679,11 @@ terraform output -raw cognito_client_secret
 ├── files/
 │   └── user_data.sh          # EC2 초기화 스크립트
 ├── lambda_package/
+│   ├── shared_llm.py         # 공유 LLM 인스턴스 (통합)
 │   ├── lambda_handler.py     # Lambda 메인 핸들러
 │   ├── graph_agent.py        # LangGraph AI Agent
 │   ├── agents_aws.py         # AWS 연동 에이전트
+│   ├── runbooks_aws.py       # 런북 벡터 검색
 │   └── slack_templates.py    # Slack 메시지 템플릿
 └── lambda_layer/             # Lambda 의존성 패키지
 ```
