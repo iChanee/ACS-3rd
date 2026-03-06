@@ -227,15 +227,79 @@ AWS 기반 Observability 플랫폼으로, OpenTelemetry를 활용한 로그, 트
 
 #### 동작 흐름
 
-1. SNS에서 알림 수신
-2. 즉시 Slack에 "분석 중..." 메시지 전송
-3. LangGraph 기반 AI Agent 실행:
-   - 메트릭 분석 (AMP 쿼리)
-   - 로그 분석 (OpenSearch 쿼리)
-   - 트레이스 분석 (OpenSearch 쿼리)
-   - 런북 검색 (OpenSearch Serverless 벡터 검색)
-   - Bedrock으로 종합 분석
-4. Slack에 최종 분석 결과 전송 (Block Kit 형식)
+```
+AMP Alert → Alertmanager → SNS → Lambda (handler)
+                                    ↓
+                            LangGraph AI Agent
+                                    ↓
+                    ┌───────────────┼───────────────┐
+                    ↓               ↓               ↓
+            Metrics Agent    Logs Agent    Traces Agent
+                    ↓               ↓               ↓
+            (AMP 쿼리)      (OpenSearch)    (OpenSearch)
+                    ↓               ↓               ↓
+            PromQL 실행      로그 검색      트레이스 검색
+                    └───────────────┼───────────────┘
+                                    ↓
+                            Bedrock (Claude)
+                            종합 분석 및 JSON 생성
+                                    ↓
+                                Slack 전송
+```
+
+**상세 단계:**
+
+1. **SNS에서 알림 수신** (lambda_handler.py)
+   - 알림 파싱 (alertname, severity, service 등)
+
+2. **즉시 Slack에 "분석 중..." 메시지 전송**
+   - 사용자에게 빠른 피드백 제공
+
+3. **LangGraph 기반 AI Agent 실행** (graph_agent.py)
+
+   a. **Classify Node**: Bedrock Claude가 질문 분석
+   - 어떤 데이터가 필요한지 판단 (metrics/logs/traces)
+
+   b. **병렬 데이터 수집** (3개 Agent 동시 실행):
+   - **Metrics Agent** (agents_aws.py)
+     - Strands Agent가 상황에 맞는 Tool 선택 및 실행
+     - Tools: `get_metrics_summary`, `get_jvm_metrics`, `get_http_metrics`
+     - 실제 동작: boto3로 AMP에 SigV4 인증 후 PromQL 쿼리 실행
+     - 예시 쿼리: `jvm_cpu_recent_utilization_ratio`, `histogram_quantile(0.95, ...)`
+   - **Logs Agent** (agents_aws.py)
+     - Strands Agent가 상황에 맞는 Tool 선택 및 실행
+     - Tools: `get_logs_summary`, `search_logs`, `get_error_logs`
+     - 실제 동작: OpenSearch REST API에 Basic Auth로 쿼리 실행
+     - 예시: `logs-*` 인덱스에서 severity, keyword 검색
+   - **Traces Agent** (agents_aws.py)
+     - Strands Agent가 상황에 맞는 Tool 선택 및 실행
+     - Tools: `get_traces_summary`, `get_slow_spans`, `get_trace_by_id`
+     - 실제 동작: OpenSearch REST API로 `otel-v1-apm-span-*` 인덱스 쿼리
+     - 예시: durationInNanos > threshold인 느린 span 검색
+
+   c. **Runbook Search Node**
+   - OpenSearch Serverless 벡터 검색
+   - Bedrock Titan Embed로 임베딩 후 유사도 검색
+
+   d. **Synthesize Node**: Bedrock Claude가 최종 분석
+   - 입력: 3개 Agent 결과 + 런북 검색 결과
+   - 출력: JSON 형식 IncidentReport
+     ```json
+     {
+       "incident_summary": "한 문장 요약",
+       "likely_root_causes": ["원인1", "원인2"],
+       "severity": "critical",
+       "impact": "영향 범위 설명",
+       "immediate_actions": ["즉시 조치1", "즉시 조치2"],
+       "follow_up_actions": ["후속 조치1", "후속 조치2"],
+       "evidence_summary": ["근거1", "근거2"],
+       "runbook_references": [...]
+     }
+     ```
+
+4. **Slack에 최종 분석 결과 전송** (Block Kit 형식)
+   - 기존 "분석 중..." 메시지 삭제
+   - 최종 분석 결과 새로 전송 (색상, 섹션, 필드 포함)
 
 ### OpenSearch Serverless - 런북 벡터 검색
 
@@ -295,7 +359,117 @@ AWS 기반 Observability 플랫폼으로, OpenTelemetry를 활용한 로그, 트
 
 ---
 
-## 7. 데이터 흐름
+## 7. AI Agent 상세 동작 원리
+
+### Lambda가 Bedrock과 AMP/OpenSearch를 사용하는 방식
+
+Lambda 함수는 **직접** Bedrock을 호출하지 않고, **LangGraph + Strands Agent 패턴**을 사용합니다:
+
+#### 1단계: LangGraph 워크플로우 제어
+
+- **graph_agent.py**가 전체 흐름을 제어
+- 노드: classify → metrics/logs/traces (병렬) → runbook → synthesize
+- 각 노드는 독립적으로 실행되며 상태(State)를 공유
+
+#### 2단계: Strands Agent가 Tool 선택
+
+- **agents_aws.py**에 3개의 전문 Agent 정의:
+  - `metrics_agent`: 메트릭 분석 전문
+  - `logs_agent`: 로그 분석 전문
+  - `traces_agent`: 트레이스 분석 전문
+
+- 각 Agent는 **Bedrock Claude**를 LLM으로 사용
+- Agent가 질문을 받으면 **자동으로 적절한 Tool을 선택하여 실행**
+
+#### 3단계: Tool이 실제 데이터 조회
+
+각 Tool 함수는 **직접** AWS 서비스에 쿼리를 실행합니다:
+
+**Metrics Tools → AMP 쿼리**
+
+```python
+def query_amp(promql: str):
+    # boto3로 SigV4 인증
+    # AMP API에 PromQL 쿼리 전송
+    # 예: jvm_cpu_recent_utilization_ratio
+```
+
+**Logs Tools → OpenSearch 쿼리**
+
+```python
+def query_opensearch(index: str, query: dict):
+    # Basic Auth로 OpenSearch REST API 호출
+    # 예: logs-* 인덱스에서 ERROR 로그 검색
+```
+
+**Traces Tools → OpenSearch 쿼리**
+
+```python
+def query_opensearch("otel-v1-apm-span-*", query):
+    # OpenSearch REST API로 트레이스 데이터 조회
+    # 예: durationInNanos > 100ms인 느린 span 검색
+```
+
+#### 4단계: Bedrock이 결과 해석 및 종합
+
+- **Metrics Agent**: Tool 실행 결과를 받아 Bedrock이 해석
+  - "JVM CPU 80% 초과, 메모리 85% 사용 중" → "리소스 부족 상태"
+- **Logs Agent**: Tool 실행 결과를 받아 Bedrock이 해석
+  - "ERROR 로그 50건, OutOfMemoryError 발견" → "메모리 부족으로 인한 장애"
+- **Traces Agent**: Tool 실행 결과를 받아 Bedrock이 해석
+  - "P95 응답시간 2초, DB 쿼리 느림" → "데이터베이스 성능 저하"
+
+#### 5단계: 최종 종합 분석
+
+- **Synthesize Node**에서 Bedrock이 모든 결과를 종합
+- 입력: 3개 Agent의 분석 결과 + 런북 검색 결과
+- 출력: 구조화된 JSON (IncidentReport)
+
+### 핵심 포인트
+
+1. **Lambda는 오케스트레이터 역할**
+   - LangGraph로 워크플로우 제어
+   - 각 단계를 순차/병렬 실행
+
+2. **Bedrock은 2가지 역할**
+   - **Tool 선택**: Agent가 어떤 Tool을 실행할지 결정
+   - **결과 해석**: Tool 실행 결과를 사람이 이해할 수 있게 분석
+
+3. **실제 데이터 조회는 Tool 함수가 직접 수행**
+   - AMP: boto3 + SigV4 인증 + PromQL
+   - OpenSearch: urllib + Basic Auth + REST API
+
+4. **Bedrock은 데이터를 직접 보지 않음**
+   - Tool이 조회한 결과(텍스트)를 받아서 해석만 함
+   - 예: "CPU 80%" → Bedrock → "리소스 부족 상태로 판단됨"
+
+### 데이터 흐름 예시
+
+```
+알람 발생: HighJvmCpu
+    ↓
+Lambda Handler: "JVM CPU 80% 초과 알람 분석해줘"
+    ↓
+LangGraph Classify: "metrics 데이터 필요"
+    ↓
+Metrics Agent (Bedrock): "get_jvm_metrics 실행해야겠다"
+    ↓
+get_jvm_metrics Tool: AMP에 PromQL 쿼리
+    → jvm_cpu_recent_utilization_ratio
+    → 결과: service-a: 0.85, service-b: 0.45
+    ↓
+Metrics Agent (Bedrock): "service-a의 CPU가 85%로 높음"
+    ↓
+Synthesize (Bedrock): 모든 결과 종합
+    → "service-a의 CPU 과부하로 인한 성능 저하"
+    → JSON 생성
+    ↓
+Slack 전송
+```
+
+---
+
+## 8. 데이터 흐름
 
 ### 메트릭 흐름
 
@@ -331,7 +505,7 @@ AMP Alert → Alertmanager → SNS → Lambda → AI 분석 → Slack
 
 ---
 
-## 8. 주요 엔드포인트
+## 9. 주요 엔드포인트
 
 ### 데이터 수집
 
@@ -351,7 +525,7 @@ AMP Alert → Alertmanager → SNS → Lambda → AI 분석 → Slack
 
 ---
 
-## 9. 비용 최적화
+## 10. 비용 최적화
 
 ### 데이터 보관 정책
 
@@ -369,7 +543,7 @@ AMP Alert → Alertmanager → SNS → Lambda → AI 분석 → Slack
 
 ---
 
-## 10. 보안 구성
+## 11. 보안 구성
 
 ### 네트워크 보안
 
@@ -393,7 +567,7 @@ AMP Alert → Alertmanager → SNS → Lambda → AI 분석 → Slack
 
 ---
 
-## 11. 모니터링 및 운영
+## 12. 모니터링 및 운영
 
 ### 헬스 체크
 
@@ -426,7 +600,7 @@ sudo systemctl status grafana-server
 
 ---
 
-## 12. 배포 방법
+## 13. 배포 방법
 
 ### 사전 준비
 
@@ -465,7 +639,7 @@ terraform output -raw cognito_client_secret
 
 ---
 
-## 13. 주요 파일 구조
+## 14. 주요 파일 구조
 
 ```
 .
@@ -487,7 +661,7 @@ terraform output -raw cognito_client_secret
 
 ---
 
-## 14. 확장 계획
+## 15. 확장 계획
 
 ### 단기
 
@@ -509,7 +683,7 @@ terraform output -raw cognito_client_secret
 
 ---
 
-## 15. 문제 해결
+## 16. 문제 해결
 
 ### EC2 OTel Collector 연결 실패
 
